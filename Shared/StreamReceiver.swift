@@ -13,7 +13,6 @@
 // default names, cursor drawing, orientation) are injected by the app layer.
 
 import Foundation
-import Compression
 import Network
 import AVFoundation
 import CoreMedia
@@ -1692,146 +1691,58 @@ final class StreamReceiver: ObservableObject {
     /// "ODRZ": a whole frame as independent LZ4 strips (PROTOCOL.md 6.8), decoded in
     /// parallel straight into the pixel buffer.
     private func handleRawCompressed(_ frame: UnsafeRawBufferPointer) {
-        func u32(_ offset: Int) -> Int {
-            Int(UInt32(littleEndian: frame.loadUnaligned(fromByteOffset: offset, as: UInt32.self)))
-        }
-        func i64(_ offset: Int) -> Int64 {
-            Int64(littleEndian: frame.loadUnaligned(fromByteOffset: offset, as: Int64.self))
-        }
-        let width = u32(4), height = u32(8), strip = u32(12), count = u32(16)
-        let bands = strip > 0 ? (height + strip - 1) / strip : 0
-        guard width > 0, height > 0, width % 2 == 0, height % 2 == 0, strip > 0, strip % 2 == 0,
-              count == bands * 2, 36 + 4 * count <= frame.count else {
+        guard let header = RawFrameCodec.stripHeader(frame) else {
             requestKeyframeIfNeeded()
             return
         }
-        var sources = [Int](repeating: 0, count: count)     // offset of each strip in `frame`
-        var sizes = [Int](repeating: 0, count: count)
-        var offset = 36 + 4 * count
-        var i = 0
-        while i < count {
-            sizes[i] = u32(36 + 4 * i)
-            sources[i] = offset
-            offset += sizes[i]
-            i += 1
-        }
-        guard offset == frame.count else {
-            requestKeyframeIfNeeded()
-            return
-        }
-        announceRawSize(width: width, height: height)
+        announceRawSize(width: header.width, height: header.height)
         let t0 = nowMs
-        guard let pixelBuffer = rawPixelBuffer(width: width, height: height) else { return }
+        guard let pixelBuffer = rawPixelBuffer(width: header.width, height: header.height) else { return }
         CVPixelBufferLockBaseAddress(pixelBuffer, [])
-        let yStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
-        let cStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1)
-        guard let yBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0),
-              let cBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1) else {
-            CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
-            return
-        }
-        let base = frame.baseAddress!
-        var failed: Int32 = 0
-        let failedLock = NSLock()
-        DispatchQueue.concurrentPerform(iterations: count) { index in
-            let luma = index < bands
-            let band = luma ? index : index - bands
-            let rows = min(strip, height - band * strip) / (luma ? 1 : 2)
-            let rawSize = rows * width
-            let stride = luma ? yStride : cStride
-            let firstRow = band * (luma ? strip : strip / 2)
-            let target = (luma ? yBase : cBase) + firstRow * stride
-            let source = base + sources[index]
-            // Decode into a temporary only when the buffer's rows are padded.
-            let direct = stride == width
-            let scratch = direct ? nil : malloc(rawSize)
-            let output = direct ? target : scratch!
-            var ok = true
-            if sizes[index] == rawSize {
-                memcpy(output, source, rawSize)
-            } else {
-                ok = compression_decode_buffer(output.assumingMemoryBound(to: UInt8.self), rawSize,
-                                               source.assumingMemoryBound(to: UInt8.self), sizes[index],
-                                               nil, COMPRESSION_LZ4) == rawSize
-            }
-            if !direct, let scratch {
-                var row = 0
-                while row < rows {
-                    memcpy(target + row * stride, scratch + row * width, width)
-                    row += 1
-                }
-                free(scratch)
-            }
-            if !ok { failedLock.lock(); failed += 1; failedLock.unlock() }
+        let ok: Bool
+        if let yBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0),
+           let cBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1) {
+            ok = RawFrameCodec.decompress(frame, header: header, y: yBase, c: cBase,
+                                          yStride: CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0),
+                                          cStride: CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1))
+        } else {
+            ok = false
         }
         CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
-        guard failed == 0 else {
-            Log.info("raw frame: \(failed) strips failed to decompress")
+        guard ok else {
+            Log.info("raw frame: a strip failed to decompress")
             requestKeyframeIfNeeded()
             return
         }
         rawCanvasStale = true
-        showRawFrame(pixelBuffer, capMs: i64(20), sndMs: i64(28), startedAt: t0)
+        showRawFrame(pixelBuffer, capMs: header.captureMs, sndMs: header.sendMs, startedAt: t0)
     }
 
     private func handleRawDelta(_ frame: UnsafeRawBufferPointer) {
-        func u32(_ offset: Int) -> Int {
-            Int(UInt32(littleEndian: frame.loadUnaligned(fromByteOffset: offset, as: UInt32.self)))
+        guard let header = RawFrameCodec.deltaHeader(frame) else {
+            requestKeyframeIfNeeded()
+            return
         }
-        func i64(_ offset: Int) -> Int64 {
-            Int64(littleEndian: frame.loadUnaligned(fromByteOffset: offset, as: Int64.self))
-        }
-        let width = u32(4), height = u32(8), tile = u32(12), count = u32(16)
+        let width = header.width, height = header.height
         if rawCanvasStale, let last = rawLastBuffer,
            CVPixelBufferGetWidth(last) == width, CVPixelBufferGetHeight(last) == height {
             rebuildRawCanvas(from: last, width: width, height: height)
             rawCanvasStale = false
         }
-        guard tile > 0, tile % 2 == 0, !rawCanvasStale, rawCanvasSize == (width, height),
+        guard !rawCanvasStale, rawCanvasSize == (width, height),
               let canvasY = rawCanvasY, let canvasC = rawCanvasC else {
             requestKeyframeIfNeeded()   // no picture to patch: ask for a whole frame
             return
         }
         let t0 = nowMs
         guard let pixelBuffer = rawPixelBuffer(width: width, height: height) else { return }
-        let tilesX = (width + tile - 1) / tile, tilesY = (height + tile - 1) / tile
-        // Plain while loops: range iteration is very slow in unoptimised builds.
-        var offset = 36
-        let base = frame.baseAddress!
-        var tileIndex = 0
-        while tileIndex < count {
-            tileIndex += 1
-            guard offset + 4 <= frame.count else { break }
-            let index = u32(offset)
-            offset += 4
-            let ty = index / tilesX, tx = index % tilesX
-            let rows = min(tile, height - ty * tile)
-            let bytes = min(tile, width - tx * tile)
-            guard ty < tilesY, offset + (rows + rows / 2) * bytes <= frame.count else {
-                rawCanvasSize = (0, 0)   // corrupt patch: do not keep a half-applied picture
-                requestKeyframeIfNeeded()
-                return
-            }
-            let x0 = tx * tile
-            var dst = canvasY + ty * tile * width + x0
-            var r = 0
-            while r < rows {
-                memcpy(dst, base + offset, bytes)
-                dst += width
-                offset += bytes
-                r += 1
-            }
-            dst = canvasC + ty * (tile / 2) * width + x0
-            r = 0
-            while r < rows / 2 {
-                memcpy(dst, base + offset, bytes)
-                dst += width
-                offset += bytes
-                r += 1
-            }
+        guard RawFrameCodec.applyDelta(frame, canvasY: canvasY, canvasC: canvasC) else {
+            rawCanvasSize = (0, 0)   // corrupt patch: do not keep a half-applied picture
+            requestKeyframeIfNeeded()
+            return
         }
         blitRawCanvas(to: pixelBuffer, width: width, height: height)
-        showRawFrame(pixelBuffer, capMs: i64(20), sndMs: i64(28), startedAt: t0)
+        showRawFrame(pixelBuffer, capMs: header.captureMs, sndMs: header.sendMs, startedAt: t0)
     }
 
     // MARK: - Explicit decode (Metal renderer path)

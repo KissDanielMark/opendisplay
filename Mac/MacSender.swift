@@ -18,7 +18,6 @@ import VideoToolbox
 import Network
 import CoreMedia
 import AppKit
-import Compression
 
 enum CaptureMode: String {
     case mirror   // main display (Milestone 1)
@@ -3431,27 +3430,22 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     // MARK: Changed-tile frames ("ODRD")
 
-    private static let rawTile = 64
     private var rawLastSent: CVPixelBuffer?
     private var rawSendStats = (full: 0, delta: 0, skipped: 0, deltaBytes: 0, compressed: 0, compressedBytes: 0)
     private var rawSendStatsStart = Date()
 
     // MARK: Compressed whole frames ("ODRZ")
 
-    private static let rawChunkRows = 64
     private var rawCompressSkip = 0
     /// `defaults write … rawCompress -bool NO` sends whole frames uncompressed.
     private static let rawCompressionEnabled: Bool = {
         UserDefaults.standard.object(forKey: "rawCompress") == nil || UserDefaults.standard.bool(forKey: "rawCompress")
     }()
 
-    /// A whole frame as independent LZ4 strips (64 luma rows each, then the matching
-    /// 32 CbCr rows), so both ends can work on them in parallel. After the 4-byte
-    /// length: "ODRZ", width, height, strip rows, strip count (u32), cap ms, snd ms
-    /// (i64), then one u32 compressed size per strip (equal to the raw size when the
-    /// strip is stored as is), then the strips. Nil when it would not save at least
-    /// 10% (then the frame goes out as a plain "ODRW" and compression pauses for a while).
-    /// `current` must already be locked by the caller.
+    /// A whole frame as independent LZ4 strips (`RawFrameCodec.compress`), or nil
+    /// when it would not save at least 10% (then the frame goes out as a plain
+    /// "ODRW" and compression pauses for a while). `current` must already be
+    /// locked by the caller.
     private func rawCompressed(_ current: CVPixelBuffer, nowMs: Int64) -> Data? {
         guard Self.rawCompressionEnabled else { return nil }
         if rawCompressSkip > 0 { rawCompressSkip -= 1; return nil }
@@ -3460,71 +3454,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
               CVPixelBufferGetBytesPerRowOfPlane(current, 1) == width,
               let yBase = CVPixelBufferGetBaseAddressOfPlane(current, 0),
               let cBase = CVPixelBufferGetBaseAddressOfPlane(current, 1) else { return nil }
-        let strip = Self.rawChunkRows
-        let bands = (height + strip - 1) / strip
-        let count = bands * 2
-        let ySize = width * height
-        guard let scratch = malloc(ySize * 3 / 2) else { return nil }
-        defer { free(scratch) }
-        var sizes = [Int](repeating: 0, count: count)
-        sizes.withUnsafeMutableBufferPointer { out in
-            let sizesOut = out.baseAddress!
-            DispatchQueue.concurrentPerform(iterations: count) { i in
-                let luma = i < bands
-                let band = luma ? i : i - bands
-                let rows = min(strip, height - band * strip)
-                let rawSize = (luma ? rows : rows / 2) * width
-                let source = luma ? yBase + band * strip * width : cBase + band * (strip / 2) * width
-                let target = scratch + (luma ? band * strip * width : ySize + band * (strip / 2) * width)
-                let n = compression_encode_buffer(target.assumingMemoryBound(to: UInt8.self), rawSize,
-                                                  source.assumingMemoryBound(to: UInt8.self), rawSize,
-                                                  nil, COMPRESSION_LZ4)
-                if n == 0 || n >= rawSize {
-                    memcpy(target, source, rawSize)
-                    sizesOut[i] = rawSize
-                } else {
-                    sizesOut[i] = n
-                }
-            }
+        if let compressed = RawFrameCodec.compress(y: yBase, c: cBase, width: width, height: height, nowMs: nowMs) {
+            return compressed
         }
-        var total = 0
-        var k = 0
-        while k < count { total += sizes[k]; k += 1 }
-        if total * 10 > ySize * 3 / 2 * 9 {
-            rawCompressSkip = 30
-            return nil
-        }
-        let headerSize = 4 + 36 + 4 * count
-        let size = headerSize + total
-        guard let buffer = malloc(size) else { return nil }
-        func put<T: FixedWidthInteger>(_ value: T, at offset: Int) {
-            var v = value.littleEndian
-            memcpy(buffer + offset, &v, MemoryLayout<T>.size)
-        }
-        var lengthBE = UInt32(size - 4).bigEndian
-        memcpy(buffer, &lengthBE, 4)
-        memcpy(buffer + 4, Array("ODRZ".utf8), 4)
-        put(UInt32(width), at: 8); put(UInt32(height), at: 12)
-        put(UInt32(strip), at: 16); put(UInt32(count), at: 20)
-        put(nowMs, at: 24); put(nowMs, at: 32)
-        var offset = headerSize
-        k = 0
-        while k < count {
-            put(UInt32(sizes[k]), at: 40 + 4 * k)
-            let luma = k < bands
-            let band = luma ? k : k - bands
-            memcpy(buffer + offset, scratch + (luma ? band * strip * width : ySize + band * (strip / 2) * width), sizes[k])
-            offset += sizes[k]
-            k += 1
-        }
-        return Data(bytesNoCopy: buffer, count: size, deallocator: .free)
+        rawCompressSkip = 30
+        return nil
     }
 
-    private enum RawDelta {
-        case identical, full
-        case delta(Data)
-    }
-
+    private typealias RawDelta = RawFrameCodec.DeltaResult
     private func sendRawPayload(_ payload: Data, on connection: NWConnection) {
         pendingSends += 1
         connection.send(content: payload, completion: .contentProcessed { [weak self] error in
@@ -3549,10 +3486,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         rawSendStatsStart = Date()
     }
 
-    /// Compare against the last frame sent, tile by tile. Frame layout after the
-    /// 4-byte length: "ODRD", width, height, tile size, tile count (u32), cap ms,
-    /// snd ms (i64), then per changed tile: index (u32), `tile`x`tile` luma rows,
-    /// then its half-height CbCr rows (all little-endian, tightly packed).
+    /// Compare against the last frame sent, tile by tile (`RawFrameCodec.delta`).
     /// `current` must already be locked by the caller.
     private func rawDelta(previous: CVPixelBuffer, current: CVPixelBuffer, nowMs: Int64) -> RawDelta {
         guard let previousLock = LockedPixels(previous) else { return .full }
@@ -3565,99 +3499,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let cStride = CVPixelBufferGetBytesPerRowOfPlane(current, 1)
         guard CVPixelBufferGetBytesPerRowOfPlane(previous, 0) == yStride,
               CVPixelBufferGetBytesPerRowOfPlane(previous, 1) == cStride else { return .full }
-        let tile = Self.rawTile
-        let width = CVPixelBufferGetWidth(current), height = CVPixelBufferGetHeight(current)
-        let tilesX = (width + tile - 1) / tile, tilesY = (height + tile - 1) / tile
-
-        // Plain while loops throughout: range iteration is very slow in unoptimised builds.
-        var dirty = [UInt8](repeating: 0, count: tilesX * tilesY)
-        dirty.withUnsafeMutableBufferPointer { out in
-            let flags = out.baseAddress!
-            DispatchQueue.concurrentPerform(iterations: tilesY) { ty in
-                let rows = min(tile, height - ty * tile)
-                var tx = 0
-                while tx < tilesX {
-                    let x0 = tx * tile
-                    let bytes = min(tile, width - x0)
-                    var differs = false
-                    var row = ty * tile
-                    let lumaEnd = row + rows
-                    while row < lumaEnd, !differs {
-                        if memcmp(pY + row * yStride + x0, cY + row * yStride + x0, bytes) != 0 { differs = true }
-                        row += 1
-                    }
-                    row = ty * tile / 2
-                    let chromaEnd = row + rows / 2
-                    while row < chromaEnd, !differs {
-                        if memcmp(pC + row * cStride + x0, cC + row * cStride + x0, bytes) != 0 { differs = true }
-                        row += 1
-                    }
-                    if differs { flags[ty * tilesX + tx] = 1 }
-                    tx += 1
-                }
-            }
-        }
-        var changed = 0
-        var i = 0
-        while i < dirty.count { changed += Int(dirty[i]); i += 1 }
-        if changed == 0 { return .identical }
-        if changed * 10 > tilesX * tilesY * 6 { return .full }   // over 60%: a whole frame is cheaper
-
-        let headerSize = 4 + 36
-        var size = headerSize
-        var ty = 0
-        while ty < tilesY {
-            let rows = min(tile, height - ty * tile)
-            var tx = 0
-            while tx < tilesX {
-                if dirty[ty * tilesX + tx] != 0 { size += 4 + (rows + rows / 2) * min(tile, width - tx * tile) }
-                tx += 1
-            }
-            ty += 1
-        }
-        guard let buffer = malloc(size) else { return .full }
-        func put<T: FixedWidthInteger>(_ value: T, at offset: Int) {
-            var v = value.littleEndian
-            memcpy(buffer + offset, &v, MemoryLayout<T>.size)
-        }
-        var lengthBE = UInt32(size - 4).bigEndian
-        memcpy(buffer, &lengthBE, 4)
-        memcpy(buffer + 4, Array("ODRD".utf8), 4)
-        put(UInt32(width), at: 8); put(UInt32(height), at: 12)
-        put(UInt32(tile), at: 16); put(UInt32(changed), at: 20)
-        put(nowMs, at: 24); put(nowMs, at: 32)
-        var offset = headerSize
-        ty = 0
-        while ty < tilesY {
-            let rows = min(tile, height - ty * tile)
-            var tx = 0
-            while tx < tilesX {
-                if dirty[ty * tilesX + tx] != 0 {
-                    let x0 = tx * tile
-                    let bytes = min(tile, width - x0)
-                    put(UInt32(ty * tilesX + tx), at: offset); offset += 4
-                    var src = cY + ty * tile * yStride + x0
-                    var r = 0
-                    while r < rows {
-                        memcpy(buffer + offset, src, bytes)
-                        src += yStride
-                        offset += bytes
-                        r += 1
-                    }
-                    src = cC + ty * (tile / 2) * cStride + x0
-                    r = 0
-                    while r < rows / 2 {
-                        memcpy(buffer + offset, src, bytes)
-                        src += cStride
-                        offset += bytes
-                        r += 1
-                    }
-                }
-                tx += 1
-            }
-            ty += 1
-        }
-        return .delta(Data(bytesNoCopy: buffer, count: size, deallocator: .free))
+        return RawFrameCodec.delta(previousY: pY, previousC: pC, currentY: cY, currentC: cC,
+                                   width: CVPixelBufferGetWidth(current), height: CVPixelBufferGetHeight(current),
+                                   yStride: yStride, cStride: cStride, nowMs: nowMs)
     }
 
     // MARK: - Helpers
