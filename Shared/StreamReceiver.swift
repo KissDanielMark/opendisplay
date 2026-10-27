@@ -945,6 +945,7 @@ final class StreamReceiver: ObservableObject {
         photonWindow.removeAll(keepingCapacity: true)
         rawPool = nil
         rawPoolSize = (0, 0)
+        rawCanvasSize = (0, 0)
     }
 
     // MARK: - Control messages (phone -> Mac)
@@ -1155,7 +1156,7 @@ final class StreamReceiver: ObservableObject {
             let start = buffer.index(cursor, offsetBy: 4)
             let end = buffer.index(start, offsetBy: len)
             if streamCodec == "raw", len >= 4,
-               buffer[start..<buffer.index(start, offsetBy: 4)].elementsEqual("ODRW".utf8) {
+               buffer[start..<buffer.index(start, offsetBy: 3)].elementsEqual("ODR".utf8) {
                 // A raw frame is ~22 MB at 5K: parse it in place, no copy.
                 let offset = buffer.distance(from: buffer.startIndex, to: start)
                 buffer.withUnsafeBytes { whole in
@@ -1545,11 +1546,77 @@ final class StreamReceiver: ObservableObject {
         return buffer
     }
 
-    /// `frame` is one length-prefixed payload that starts with the "ODRW"
-    /// header: width, height, format (0 = NV12 video range), Y stride, CbCr
-    /// stride, cap ms, snd ms (little-endian), then the two planes.
+    // The last whole picture, kept in ordinary cached memory (tight rows).
+    // Never read it back from a Metal-compatible pixel buffer: those are
+    // write-combined and a CPU read is an order of magnitude slower than a
+    // write (measured 24-41 ms vs 4 ms per 5K frame on the iMac).
+    private var rawCanvasY: UnsafeMutableRawPointer?
+    private var rawCanvasC: UnsafeMutableRawPointer?
+    private var rawCanvasSize = (width: 0, height: 0)   // (0, 0) = no picture to patch
+
+    private func ensureRawCanvas(width: Int, height: Int) {
+        guard rawCanvasSize != (width, height) || rawCanvasY == nil else { return }
+        free(rawCanvasY); free(rawCanvasC)
+        rawCanvasY = malloc(width * height)
+        rawCanvasC = malloc(width * height / 2)
+        rawCanvasSize = (width, height)
+    }
+
+    /// Write the canvas into a pooled pixel buffer (write-only access).
+    private func blitRawCanvas(to pixelBuffer: CVPixelBuffer, width: Int, height: Int) {
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+        let planes: [(UnsafeMutableRawPointer?, Int)] = [(rawCanvasY, height), (rawCanvasC, height / 2)]
+        for (plane, source) in planes.enumerated() {
+            guard let from = source.0, let to = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, plane) else { continue }
+            let stride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, plane)
+            if stride == width {
+                memcpy(to, from, width * source.1)
+            } else {
+                var row = 0
+                while row < source.1 {
+                    memcpy(to + row * stride, from + row * width, width)
+                    row += 1
+                }
+            }
+        }
+    }
+
+    /// The video window opens once the size is known and only then creates
+    /// the picture sink, so announce the size before requiring the sink.
+    private func announceRawSize(width: Int, height: Int) {
+        let size = CGSize(width: width, height: height)
+        guard size != rawFrameSize else { return }
+        rawFrameSize = size
+        Log.info("raw stream: \(width)x\(height)")
+        DispatchQueue.main.async { self.videoSize = size }
+        setStatus("Receiving \(width)×\(height)")
+    }
+
+    private func showRawFrame(_ pixelBuffer: CVPixelBuffer, capMs: Int64, sndMs: Int64, startedAt t0: Double) {
+        decodeWindow.append(nowMs - t0)
+        guard onDecodedFrame != nil else { return }
+        onDecodedFrame?(pixelBuffer, Double(capMs))
+        noteFrameShown(captureMs: Double(capMs), sendMs: Double(sndMs))
+    }
+
+    /// `frame` is one length-prefixed payload that starts with "ODRW" (a whole
+    /// picture) or "ODRD" (changed tiles to patch into the last picture);
+    /// layouts in PROTOCOL.md 6.8, little-endian.
     private func handleRawFrame(_ frame: UnsafeRawBufferPointer) {
-        guard !renderingPaused, frame.count >= 40 else { return }
+        guard frame.count >= 36 else { return }
+        // Paused (backgrounded): skip the picture and forget the canvas, so the
+        // next delta asks the sender for a whole frame instead of patching a stale one.
+        if renderingPaused { rawCanvasSize = (0, 0); return }
+        switch frame[3] {
+        case UInt8(ascii: "W"): handleRawFull(frame)
+        case UInt8(ascii: "D"): handleRawDelta(frame)
+        default: break
+        }
+    }
+
+    private func handleRawFull(_ frame: UnsafeRawBufferPointer) {
+        guard frame.count >= 40 else { return }
         func u32(_ offset: Int) -> Int {
             Int(UInt32(littleEndian: frame.loadUnaligned(fromByteOffset: offset, as: UInt32.self)))
         }
@@ -1567,39 +1634,79 @@ final class StreamReceiver: ObservableObject {
             }
             return
         }
-        // The video window opens once the size is known and only then creates
-        // the picture sink, so announce the size before requiring the sink.
-        let size = CGSize(width: width, height: height)
-        if size != rawFrameSize {
-            rawFrameSize = size
-            Log.info("raw stream: \(width)x\(height)")
-            DispatchQueue.main.async { self.videoSize = size }
-            setStatus("Receiving \(width)×\(height)")
+        announceRawSize(width: width, height: height)
+        let t0 = nowMs
+        ensureRawCanvas(width: width, height: height)
+        guard let canvasY = rawCanvasY, let canvasC = rawCanvasC,
+              let pixelBuffer = rawPixelBuffer(width: width, height: height) else { return }
+        let base = frame.baseAddress!
+        var row = 0
+        while row < height {
+            memcpy(canvasY + row * width, base + 40 + row * yStride, width)
+            row += 1
         }
-        guard onDecodedFrame != nil else { return }
+        row = 0
+        while row < height / 2 {
+            memcpy(canvasC + row * width, base + 40 + yStride * height + row * cStride, width)
+            row += 1
+        }
+        blitRawCanvas(to: pixelBuffer, width: width, height: height)
+        showRawFrame(pixelBuffer, capMs: i64(24), sndMs: i64(32), startedAt: t0)
+    }
+
+    private func handleRawDelta(_ frame: UnsafeRawBufferPointer) {
+        func u32(_ offset: Int) -> Int {
+            Int(UInt32(littleEndian: frame.loadUnaligned(fromByteOffset: offset, as: UInt32.self)))
+        }
+        func i64(_ offset: Int) -> Int64 {
+            Int64(littleEndian: frame.loadUnaligned(fromByteOffset: offset, as: Int64.self))
+        }
+        let width = u32(4), height = u32(8), tile = u32(12), count = u32(16)
+        guard tile > 0, tile % 2 == 0, rawCanvasSize == (width, height),
+              let canvasY = rawCanvasY, let canvasC = rawCanvasC else {
+            requestKeyframeIfNeeded()   // no picture to patch: ask for a whole frame
+            return
+        }
         let t0 = nowMs
         guard let pixelBuffer = rawPixelBuffer(width: width, height: height) else { return }
-        CVPixelBufferLockBaseAddress(pixelBuffer, [])
-        let planes: [(offset: Int, stride: Int, rows: Int)] = [
-            (40, yStride, height), (40 + yStride * height, cStride, height / 2)]
-        for (plane, src) in planes.enumerated() {
-            guard let dst = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, plane) else { continue }
-            let dstStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, plane)
-            let from = frame.baseAddress! + src.offset
-            if dstStride == src.stride {
-                memcpy(dst, from, src.stride * src.rows)
-            } else {
-                for row in 0..<src.rows {
-                    memcpy(dst + row * dstStride, from + row * src.stride, width)
-                }
+        let tilesX = (width + tile - 1) / tile, tilesY = (height + tile - 1) / tile
+        // Plain while loops: range iteration is very slow in unoptimised builds.
+        var offset = 36
+        let base = frame.baseAddress!
+        var tileIndex = 0
+        while tileIndex < count {
+            tileIndex += 1
+            guard offset + 4 <= frame.count else { break }
+            let index = u32(offset)
+            offset += 4
+            let ty = index / tilesX, tx = index % tilesX
+            let rows = min(tile, height - ty * tile)
+            let bytes = min(tile, width - tx * tile)
+            guard ty < tilesY, offset + (rows + rows / 2) * bytes <= frame.count else {
+                rawCanvasSize = (0, 0)   // corrupt patch: do not keep a half-applied picture
+                requestKeyframeIfNeeded()
+                return
+            }
+            let x0 = tx * tile
+            var dst = canvasY + ty * tile * width + x0
+            var r = 0
+            while r < rows {
+                memcpy(dst, base + offset, bytes)
+                dst += width
+                offset += bytes
+                r += 1
+            }
+            dst = canvasC + ty * (tile / 2) * width + x0
+            r = 0
+            while r < rows / 2 {
+                memcpy(dst, base + offset, bytes)
+                dst += width
+                offset += bytes
+                r += 1
             }
         }
-        CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
-        decodeWindow.append(nowMs - t0)
-
-        let captureMs = Double(i64(24)), sendMs = Double(i64(32))
-        onDecodedFrame?(pixelBuffer, captureMs)
-        noteFrameShown(captureMs: captureMs, sendMs: sendMs)
+        blitRawCanvas(to: pixelBuffer, width: width, height: height)
+        showRawFrame(pixelBuffer, capMs: i64(20), sndMs: i64(28), startedAt: t0)
     }
 
     // MARK: - Explicit decode (Metal renderer path)

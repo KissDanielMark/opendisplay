@@ -742,8 +742,30 @@ Little-endian after the magic:
 | 40 | `ystride*height` | Y plane |
 | then | `cstride*height/2` | interleaved CbCr plane |
 
-Every frame is complete; there are no keyframes. A receiver must announce
-the video size (so its window can open) before it has anywhere to draw.
+That is a whole frame. To save link bandwidth a sender may instead send a
+*changed-tile* frame, which patches the receiver's last picture. It starts
+with `ODRD` and is likewise little-endian after the magic:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | `ODRD` |
+| 4 | 4 | width in pixels |
+| 8 | 4 | height in pixels |
+| 12 | 4 | tile size in pixels (the Mac sender uses 64) |
+| 16 | 4 | number of tiles that follow |
+| 20 | 8 | capture time, ms since the Unix epoch |
+| 28 | 8 | send time, ms since the Unix epoch |
+| 36 | | per tile: u32 index, then the tile's luma rows, then its CbCr rows |
+
+Tiles are numbered row by row from the top left; a tile is `min(tile, width -
+x)` bytes wide and `min(tile, height - y)` luma rows tall, with half as many
+CbCr rows (rows tightly packed, no stride). A delta applies to the picture
+the receiver holds after the previous frame, so a sender sends a whole frame
+first, after every new connection, after a size change, and whenever the
+receiver sends `kf` (it does when it gets a delta with no picture to patch).
+A sender skips a frame that changed nothing and sends a whole frame when
+most tiles changed. A receiver must announce the video size (so its window
+can open) before it has anywhere to draw.
 
 ## 7. Coordinate spaces and units
 

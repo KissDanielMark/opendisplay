@@ -3361,6 +3361,32 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let cLength = cStride * (height / 2)
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
 
+        // Changed tiles only, unless the receiver needs a whole picture
+        // (new connection, size change) or most of the screen moved.
+        let previous = rawLastSent
+        let mustSendFull = needsKeyframe || previous == nil
+            || CVPixelBufferGetWidth(previous!) != width || CVPixelBufferGetHeight(previous!) != height
+        needsKeyframe = false
+        if !mustSendFull, let previous {
+            switch rawDelta(previous: previous, current: pixelBuffer, nowMs: nowMs) {
+            case .identical:
+                rawSendStats.skipped += 1
+                return
+            case .delta(let payload):
+                rawLastSent = pixelBuffer
+                rawSendStats.delta += 1
+                rawSendStats.deltaBytes += payload.count
+                sendRawPayload(payload, on: connection)
+                reportRawSendStatsIfDue()
+                return
+            case .full:
+                break
+            }
+        }
+        rawLastSent = pixelBuffer
+        rawSendStats.full += 1
+        reportRawSendStatsIfDue()
+
         var head = Data(capacity: 44)
         func put<T: FixedWidthInteger>(_ value: T) {
             var v = value.littleEndian
@@ -3390,6 +3416,152 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         })
     }
     private var loggedRawFormatMismatch = false
+
+    // MARK: Changed-tile frames ("ODRD")
+
+    private static let rawTile = 64
+    private var rawLastSent: CVPixelBuffer?
+    private var rawSendStats = (full: 0, delta: 0, skipped: 0, deltaBytes: 0)
+    private var rawSendStatsStart = Date()
+
+    private enum RawDelta {
+        case identical, full
+        case delta(Data)
+    }
+
+    private func sendRawPayload(_ payload: Data, on connection: NWConnection) {
+        pendingSends += 1
+        connection.send(content: payload, completion: .contentProcessed { [weak self] error in
+            guard let self else { return }
+            self.pendingSends -= 1
+            if let error {
+                Log.info("send error: \(error)")
+                return
+            }
+            self.noteFrameSent(byteCount: payload.count)
+        })
+    }
+
+    private func reportRawSendStatsIfDue() {
+        guard Date().timeIntervalSince(rawSendStatsStart) >= 5 else { return }
+        let stats = rawSendStats
+        Log.info("raw send: \(stats.full) full, \(stats.delta) delta"
+            + (stats.delta > 0 ? " (avg \(stats.deltaBytes / stats.delta / 1024) KB)" : "")
+            + ", \(stats.skipped) unchanged")
+        rawSendStats = (0, 0, 0, 0)
+        rawSendStatsStart = Date()
+    }
+
+    /// Compare against the last frame sent, tile by tile. Frame layout after the
+    /// 4-byte length: "ODRD", width, height, tile size, tile count (u32), cap ms,
+    /// snd ms (i64), then per changed tile: index (u32), `tile`x`tile` luma rows,
+    /// then its half-height CbCr rows (all little-endian, tightly packed).
+    /// `current` must already be locked by the caller.
+    private func rawDelta(previous: CVPixelBuffer, current: CVPixelBuffer, nowMs: Int64) -> RawDelta {
+        guard let previousLock = LockedPixels(previous) else { return .full }
+        _ = previousLock   // keeps `previous` locked until this returns
+        guard let pY = CVPixelBufferGetBaseAddressOfPlane(previous, 0),
+              let pC = CVPixelBufferGetBaseAddressOfPlane(previous, 1),
+              let cY = CVPixelBufferGetBaseAddressOfPlane(current, 0),
+              let cC = CVPixelBufferGetBaseAddressOfPlane(current, 1) else { return .full }
+        let yStride = CVPixelBufferGetBytesPerRowOfPlane(current, 0)
+        let cStride = CVPixelBufferGetBytesPerRowOfPlane(current, 1)
+        guard CVPixelBufferGetBytesPerRowOfPlane(previous, 0) == yStride,
+              CVPixelBufferGetBytesPerRowOfPlane(previous, 1) == cStride else { return .full }
+        let tile = Self.rawTile
+        let width = CVPixelBufferGetWidth(current), height = CVPixelBufferGetHeight(current)
+        let tilesX = (width + tile - 1) / tile, tilesY = (height + tile - 1) / tile
+
+        // Plain while loops throughout: range iteration is very slow in unoptimised builds.
+        var dirty = [UInt8](repeating: 0, count: tilesX * tilesY)
+        dirty.withUnsafeMutableBufferPointer { out in
+            let flags = out.baseAddress!
+            DispatchQueue.concurrentPerform(iterations: tilesY) { ty in
+                let rows = min(tile, height - ty * tile)
+                var tx = 0
+                while tx < tilesX {
+                    let x0 = tx * tile
+                    let bytes = min(tile, width - x0)
+                    var differs = false
+                    var row = ty * tile
+                    let lumaEnd = row + rows
+                    while row < lumaEnd, !differs {
+                        if memcmp(pY + row * yStride + x0, cY + row * yStride + x0, bytes) != 0 { differs = true }
+                        row += 1
+                    }
+                    row = ty * tile / 2
+                    let chromaEnd = row + rows / 2
+                    while row < chromaEnd, !differs {
+                        if memcmp(pC + row * cStride + x0, cC + row * cStride + x0, bytes) != 0 { differs = true }
+                        row += 1
+                    }
+                    if differs { flags[ty * tilesX + tx] = 1 }
+                    tx += 1
+                }
+            }
+        }
+        var changed = 0
+        var i = 0
+        while i < dirty.count { changed += Int(dirty[i]); i += 1 }
+        if changed == 0 { return .identical }
+        if changed * 10 > tilesX * tilesY * 6 { return .full }   // over 60%: a whole frame is cheaper
+
+        let headerSize = 4 + 36
+        var size = headerSize
+        var ty = 0
+        while ty < tilesY {
+            let rows = min(tile, height - ty * tile)
+            var tx = 0
+            while tx < tilesX {
+                if dirty[ty * tilesX + tx] != 0 { size += 4 + (rows + rows / 2) * min(tile, width - tx * tile) }
+                tx += 1
+            }
+            ty += 1
+        }
+        guard let buffer = malloc(size) else { return .full }
+        func put<T: FixedWidthInteger>(_ value: T, at offset: Int) {
+            var v = value.littleEndian
+            memcpy(buffer + offset, &v, MemoryLayout<T>.size)
+        }
+        var lengthBE = UInt32(size - 4).bigEndian
+        memcpy(buffer, &lengthBE, 4)
+        memcpy(buffer + 4, Array("ODRD".utf8), 4)
+        put(UInt32(width), at: 8); put(UInt32(height), at: 12)
+        put(UInt32(tile), at: 16); put(UInt32(changed), at: 20)
+        put(nowMs, at: 24); put(nowMs, at: 32)
+        var offset = headerSize
+        ty = 0
+        while ty < tilesY {
+            let rows = min(tile, height - ty * tile)
+            var tx = 0
+            while tx < tilesX {
+                if dirty[ty * tilesX + tx] != 0 {
+                    let x0 = tx * tile
+                    let bytes = min(tile, width - x0)
+                    put(UInt32(ty * tilesX + tx), at: offset); offset += 4
+                    var src = cY + ty * tile * yStride + x0
+                    var r = 0
+                    while r < rows {
+                        memcpy(buffer + offset, src, bytes)
+                        src += yStride
+                        offset += bytes
+                        r += 1
+                    }
+                    src = cC + ty * (tile / 2) * cStride + x0
+                    r = 0
+                    while r < rows / 2 {
+                        memcpy(buffer + offset, src, bytes)
+                        src += cStride
+                        offset += bytes
+                        r += 1
+                    }
+                }
+                tx += 1
+            }
+            ty += 1
+        }
+        return .delta(Data(bytesNoCopy: buffer, count: size, deallocator: .free))
+    }
 
     // MARK: - Helpers
 
