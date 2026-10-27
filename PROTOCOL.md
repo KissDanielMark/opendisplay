@@ -742,8 +742,29 @@ Little-endian after the magic:
 | 40 | `ystride*height` | Y plane |
 | then | `cstride*height/2` | interleaved CbCr plane |
 
-That is a whole frame. To save link bandwidth a sender may instead send a
-*changed-tile* frame, which patches the receiver's last picture. It starts
+A sender may compress a whole frame as *strips*: `ODRZ`, little-endian after
+the magic.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | `ODRZ` |
+| 4 | 4 | width in pixels |
+| 8 | 4 | height in pixels |
+| 12 | 4 | strip height in luma rows (64 from the Mac sender, even) |
+| 16 | 4 | strip count: luma strips, then the matching CbCr strips (twice the number of luma strips) |
+| 20 | 8 | capture time, ms since the Unix epoch |
+| 28 | 8 | send time, ms since the Unix epoch |
+| 36 | 4 each | compressed size of every strip |
+| then | | the strips, concatenated |
+
+A luma strip is `strip` rows of `width` bytes; a CbCr strip is `strip/2` rows of
+`width` bytes (rows tightly packed). Each strip is raw LZ4 (Apple
+`COMPRESSION_LZ4`) of exactly that many bytes, or the bytes as they are when
+the compressed size equals the raw size. Strips are independent, so a
+receiver may decode them in parallel. A sender falls back to `ODRW` when
+compression would save under 10%.
+
+A sender may also send a *changed-tile* frame, which patches the receiver's last picture. It starts
 with `ODRD` and is likewise little-endian after the magic:
 
 | Offset | Size | Field |

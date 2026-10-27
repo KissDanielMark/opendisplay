@@ -13,6 +13,7 @@
 // default names, cursor drawing, orientation) are injected by the app layer.
 
 import Foundation
+import Compression
 import Network
 import AVFoundation
 import CoreMedia
@@ -642,7 +643,7 @@ final class StreamReceiver: ObservableObject {
                     // arrive before adopt(), then be indistinguishable from
                     // the old session's flow that adopt must retire.
                     self.sendHello(on: conn, includeCursorPort: false)
-                    conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 22) {
+                    conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) {
                         [weak self] data, _, isComplete, error in
                         guard let self else { return }
                         // Only a still-tracked candidate may adopt: adoption
@@ -946,6 +947,8 @@ final class StreamReceiver: ObservableObject {
         rawPool = nil
         rawPoolSize = (0, 0)
         rawCanvasSize = (0, 0)
+        rawLastBuffer = nil
+        rawCanvasStale = false
     }
 
     // MARK: - Control messages (phone -> Mac)
@@ -1553,6 +1556,27 @@ final class StreamReceiver: ObservableObject {
     private var rawCanvasY: UnsafeMutableRawPointer?
     private var rawCanvasC: UnsafeMutableRawPointer?
     private var rawCanvasSize = (width: 0, height: 0)   // (0, 0) = no picture to patch
+    // A whole frame is written straight to its pixel buffer and the canvas is
+    // rebuilt from it only if a delta follows (one slow read at the end of a
+    // full-screen stretch, instead of an extra 22 MB copy on every frame).
+    private var rawCanvasStale = false
+    private var rawLastBuffer: CVPixelBuffer?
+
+    private func rebuildRawCanvas(from buffer: CVPixelBuffer, width: Int, height: Int) {
+        ensureRawCanvas(width: width, height: height)
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        let planes: [(UnsafeMutableRawPointer?, Int)] = [(rawCanvasY, height), (rawCanvasC, height / 2)]
+        for (plane, target) in planes.enumerated() {
+            guard let to = target.0, let from = CVPixelBufferGetBaseAddressOfPlane(buffer, plane) else { continue }
+            let stride = CVPixelBufferGetBytesPerRowOfPlane(buffer, plane)
+            var row = 0
+            while row < target.1 {
+                memcpy(to + row * width, from + row * stride, width)
+                row += 1
+            }
+        }
+    }
 
     private func ensureRawCanvas(width: Int, height: Int) {
         guard rawCanvasSize != (width, height) || rawCanvasY == nil else { return }
@@ -1594,6 +1618,7 @@ final class StreamReceiver: ObservableObject {
     }
 
     private func showRawFrame(_ pixelBuffer: CVPixelBuffer, capMs: Int64, sndMs: Int64, startedAt t0: Double) {
+        rawLastBuffer = pixelBuffer
         decodeWindow.append(nowMs - t0)
         guard onDecodedFrame != nil else { return }
         onDecodedFrame?(pixelBuffer, Double(capMs))
@@ -1607,10 +1632,11 @@ final class StreamReceiver: ObservableObject {
         guard frame.count >= 36 else { return }
         // Paused (backgrounded): skip the picture and forget the canvas, so the
         // next delta asks the sender for a whole frame instead of patching a stale one.
-        if renderingPaused { rawCanvasSize = (0, 0); return }
+        if renderingPaused { rawCanvasSize = (0, 0); rawLastBuffer = nil; rawCanvasStale = false; return }
         switch frame[3] {
         case UInt8(ascii: "W"): handleRawFull(frame)
         case UInt8(ascii: "D"): handleRawDelta(frame)
+        case UInt8(ascii: "Z"): handleRawCompressed(frame)
         default: break
         }
     }
@@ -1636,22 +1662,116 @@ final class StreamReceiver: ObservableObject {
         }
         announceRawSize(width: width, height: height)
         let t0 = nowMs
-        ensureRawCanvas(width: width, height: height)
-        guard let canvasY = rawCanvasY, let canvasC = rawCanvasC,
-              let pixelBuffer = rawPixelBuffer(width: width, height: height) else { return }
+        guard let pixelBuffer = rawPixelBuffer(width: width, height: height) else { return }
         let base = frame.baseAddress!
-        var row = 0
-        while row < height {
-            memcpy(canvasY + row * width, base + 40 + row * yStride, width)
-            row += 1
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        let planes: [(offset: Int, stride: Int, rows: Int)] = [
+            (40, yStride, height), (40 + yStride * height, cStride, height / 2)]
+        var plane = 0
+        while plane < 2 {
+            let src = planes[plane]
+            if let dst = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, plane) {
+                let dstStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, plane)
+                if dstStride == src.stride {
+                    memcpy(dst, base + src.offset, src.stride * src.rows)
+                } else {
+                    var row = 0
+                    while row < src.rows {
+                        memcpy(dst + row * dstStride, base + src.offset + row * src.stride, width)
+                        row += 1
+                    }
+                }
+            }
+            plane += 1
         }
-        row = 0
-        while row < height / 2 {
-            memcpy(canvasC + row * width, base + 40 + yStride * height + row * cStride, width)
-            row += 1
-        }
-        blitRawCanvas(to: pixelBuffer, width: width, height: height)
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+        rawCanvasStale = true
         showRawFrame(pixelBuffer, capMs: i64(24), sndMs: i64(32), startedAt: t0)
+    }
+
+    /// "ODRZ": a whole frame as independent LZ4 strips (PROTOCOL.md 6.8), decoded in
+    /// parallel straight into the pixel buffer.
+    private func handleRawCompressed(_ frame: UnsafeRawBufferPointer) {
+        func u32(_ offset: Int) -> Int {
+            Int(UInt32(littleEndian: frame.loadUnaligned(fromByteOffset: offset, as: UInt32.self)))
+        }
+        func i64(_ offset: Int) -> Int64 {
+            Int64(littleEndian: frame.loadUnaligned(fromByteOffset: offset, as: Int64.self))
+        }
+        let width = u32(4), height = u32(8), strip = u32(12), count = u32(16)
+        let bands = strip > 0 ? (height + strip - 1) / strip : 0
+        guard width > 0, height > 0, width % 2 == 0, height % 2 == 0, strip > 0, strip % 2 == 0,
+              count == bands * 2, 36 + 4 * count <= frame.count else {
+            requestKeyframeIfNeeded()
+            return
+        }
+        var sources = [Int](repeating: 0, count: count)     // offset of each strip in `frame`
+        var sizes = [Int](repeating: 0, count: count)
+        var offset = 36 + 4 * count
+        var i = 0
+        while i < count {
+            sizes[i] = u32(36 + 4 * i)
+            sources[i] = offset
+            offset += sizes[i]
+            i += 1
+        }
+        guard offset == frame.count else {
+            requestKeyframeIfNeeded()
+            return
+        }
+        announceRawSize(width: width, height: height)
+        let t0 = nowMs
+        guard let pixelBuffer = rawPixelBuffer(width: width, height: height) else { return }
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        let yStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+        let cStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1)
+        guard let yBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0),
+              let cBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1) else {
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+            return
+        }
+        let base = frame.baseAddress!
+        var failed: Int32 = 0
+        let failedLock = NSLock()
+        DispatchQueue.concurrentPerform(iterations: count) { index in
+            let luma = index < bands
+            let band = luma ? index : index - bands
+            let rows = min(strip, height - band * strip) / (luma ? 1 : 2)
+            let rawSize = rows * width
+            let stride = luma ? yStride : cStride
+            let firstRow = band * (luma ? strip : strip / 2)
+            let target = (luma ? yBase : cBase) + firstRow * stride
+            let source = base + sources[index]
+            // Decode into a temporary only when the buffer's rows are padded.
+            let direct = stride == width
+            let scratch = direct ? nil : malloc(rawSize)
+            let output = direct ? target : scratch!
+            var ok = true
+            if sizes[index] == rawSize {
+                memcpy(output, source, rawSize)
+            } else {
+                ok = compression_decode_buffer(output.assumingMemoryBound(to: UInt8.self), rawSize,
+                                               source.assumingMemoryBound(to: UInt8.self), sizes[index],
+                                               nil, COMPRESSION_LZ4) == rawSize
+            }
+            if !direct, let scratch {
+                var row = 0
+                while row < rows {
+                    memcpy(target + row * stride, scratch + row * width, width)
+                    row += 1
+                }
+                free(scratch)
+            }
+            if !ok { failedLock.lock(); failed += 1; failedLock.unlock() }
+        }
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+        guard failed == 0 else {
+            Log.info("raw frame: \(failed) strips failed to decompress")
+            requestKeyframeIfNeeded()
+            return
+        }
+        rawCanvasStale = true
+        showRawFrame(pixelBuffer, capMs: i64(20), sndMs: i64(28), startedAt: t0)
     }
 
     private func handleRawDelta(_ frame: UnsafeRawBufferPointer) {
@@ -1662,7 +1782,12 @@ final class StreamReceiver: ObservableObject {
             Int64(littleEndian: frame.loadUnaligned(fromByteOffset: offset, as: Int64.self))
         }
         let width = u32(4), height = u32(8), tile = u32(12), count = u32(16)
-        guard tile > 0, tile % 2 == 0, rawCanvasSize == (width, height),
+        if rawCanvasStale, let last = rawLastBuffer,
+           CVPixelBufferGetWidth(last) == width, CVPixelBufferGetHeight(last) == height {
+            rebuildRawCanvas(from: last, width: width, height: height)
+            rawCanvasStale = false
+        }
+        guard tile > 0, tile % 2 == 0, !rawCanvasStale, rawCanvasSize == (width, height),
               let canvasY = rawCanvasY, let canvasC = rawCanvasC else {
             requestKeyframeIfNeeded()   // no picture to patch: ask for a whole frame
             return

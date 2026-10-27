@@ -18,6 +18,7 @@ import VideoToolbox
 import Network
 import CoreMedia
 import AppKit
+import Compression
 
 enum CaptureMode: String {
     case mirror   // main display (Milestone 1)
@@ -3391,6 +3392,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         rawLastSent = pixelBuffer
         rawSendStats.full += 1
         reportRawSendStatsIfDue()
+        if let compressed = rawCompressed(pixelBuffer, nowMs: nowMs) {
+            rawSendStats.compressed += 1
+            rawSendStats.compressedBytes += compressed.count
+            sendRawPayload(compressed, on: connection)
+            return
+        }
 
         var head = Data(capacity: 44)
         func put<T: FixedWidthInteger>(_ value: T) {
@@ -3426,8 +3433,92 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private static let rawTile = 64
     private var rawLastSent: CVPixelBuffer?
-    private var rawSendStats = (full: 0, delta: 0, skipped: 0, deltaBytes: 0)
+    private var rawSendStats = (full: 0, delta: 0, skipped: 0, deltaBytes: 0, compressed: 0, compressedBytes: 0)
     private var rawSendStatsStart = Date()
+
+    // MARK: Compressed whole frames ("ODRZ")
+
+    private static let rawChunkRows = 64
+    private var rawCompressSkip = 0
+    /// `defaults write … rawCompress -bool NO` sends whole frames uncompressed.
+    private static let rawCompressionEnabled: Bool = {
+        UserDefaults.standard.object(forKey: "rawCompress") == nil || UserDefaults.standard.bool(forKey: "rawCompress")
+    }()
+
+    /// A whole frame as independent LZ4 strips (64 luma rows each, then the matching
+    /// 32 CbCr rows), so both ends can work on them in parallel. After the 4-byte
+    /// length: "ODRZ", width, height, strip rows, strip count (u32), cap ms, snd ms
+    /// (i64), then one u32 compressed size per strip (equal to the raw size when the
+    /// strip is stored as is), then the strips. Nil when it would not save at least
+    /// 10% (then the frame goes out as a plain "ODRW" and compression pauses for a while).
+    /// `current` must already be locked by the caller.
+    private func rawCompressed(_ current: CVPixelBuffer, nowMs: Int64) -> Data? {
+        guard Self.rawCompressionEnabled else { return nil }
+        if rawCompressSkip > 0 { rawCompressSkip -= 1; return nil }
+        let width = CVPixelBufferGetWidth(current), height = CVPixelBufferGetHeight(current)
+        guard CVPixelBufferGetBytesPerRowOfPlane(current, 0) == width,
+              CVPixelBufferGetBytesPerRowOfPlane(current, 1) == width,
+              let yBase = CVPixelBufferGetBaseAddressOfPlane(current, 0),
+              let cBase = CVPixelBufferGetBaseAddressOfPlane(current, 1) else { return nil }
+        let strip = Self.rawChunkRows
+        let bands = (height + strip - 1) / strip
+        let count = bands * 2
+        let ySize = width * height
+        guard let scratch = malloc(ySize * 3 / 2) else { return nil }
+        defer { free(scratch) }
+        var sizes = [Int](repeating: 0, count: count)
+        sizes.withUnsafeMutableBufferPointer { out in
+            let sizesOut = out.baseAddress!
+            DispatchQueue.concurrentPerform(iterations: count) { i in
+                let luma = i < bands
+                let band = luma ? i : i - bands
+                let rows = min(strip, height - band * strip)
+                let rawSize = (luma ? rows : rows / 2) * width
+                let source = luma ? yBase + band * strip * width : cBase + band * (strip / 2) * width
+                let target = scratch + (luma ? band * strip * width : ySize + band * (strip / 2) * width)
+                let n = compression_encode_buffer(target.assumingMemoryBound(to: UInt8.self), rawSize,
+                                                  source.assumingMemoryBound(to: UInt8.self), rawSize,
+                                                  nil, COMPRESSION_LZ4)
+                if n == 0 || n >= rawSize {
+                    memcpy(target, source, rawSize)
+                    sizesOut[i] = rawSize
+                } else {
+                    sizesOut[i] = n
+                }
+            }
+        }
+        var total = 0
+        var k = 0
+        while k < count { total += sizes[k]; k += 1 }
+        if total * 10 > ySize * 3 / 2 * 9 {
+            rawCompressSkip = 30
+            return nil
+        }
+        let headerSize = 4 + 36 + 4 * count
+        let size = headerSize + total
+        guard let buffer = malloc(size) else { return nil }
+        func put<T: FixedWidthInteger>(_ value: T, at offset: Int) {
+            var v = value.littleEndian
+            memcpy(buffer + offset, &v, MemoryLayout<T>.size)
+        }
+        var lengthBE = UInt32(size - 4).bigEndian
+        memcpy(buffer, &lengthBE, 4)
+        memcpy(buffer + 4, Array("ODRZ".utf8), 4)
+        put(UInt32(width), at: 8); put(UInt32(height), at: 12)
+        put(UInt32(strip), at: 16); put(UInt32(count), at: 20)
+        put(nowMs, at: 24); put(nowMs, at: 32)
+        var offset = headerSize
+        k = 0
+        while k < count {
+            put(UInt32(sizes[k]), at: 40 + 4 * k)
+            let luma = k < bands
+            let band = luma ? k : k - bands
+            memcpy(buffer + offset, scratch + (luma ? band * strip * width : ySize + band * (strip / 2) * width), sizes[k])
+            offset += sizes[k]
+            k += 1
+        }
+        return Data(bytesNoCopy: buffer, count: size, deallocator: .free)
+    }
 
     private enum RawDelta {
         case identical, full
@@ -3452,8 +3543,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let stats = rawSendStats
         Log.info("raw send: \(stats.full) full, \(stats.delta) delta"
             + (stats.delta > 0 ? " (avg \(stats.deltaBytes / stats.delta / 1024) KB)" : "")
+            + (stats.compressed > 0 ? ", \(stats.compressed) compressed (avg \(stats.compressedBytes / stats.compressed / 1024) KB)" : "")
             + ", \(stats.skipped) unchanged")
-        rawSendStats = (0, 0, 0, 0)
+        rawSendStats = (0, 0, 0, 0, 0, 0)
         rawSendStatsStart = Date()
     }
 
