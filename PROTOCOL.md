@@ -715,6 +715,36 @@ change for any of this: `streamConfig` announces the stream.
 In mirror sessions `panel` only bounds the stream; the desktop is the
 sender's own display.
 
+### 6.8 Raw video (`codec: "raw"`)
+
+An opt-in codec for a fast wired link (Thunderbolt Bridge, 10 Gbit/s): the
+sender skips its encoder and the receiver its decoder. A receiver offers
+`{"codec":"raw","maxFrameRate":N}` in `videoCaps`; `maxFrameRate` is how
+much the link can carry (5120x2880 NV12 is about 177 Mbit per frame, so 30
+fps is about 5.3 Gbit/s). A sender that does not know the codec ignores the
+entry and sends H.264 or HEVC. When it picks raw, `streamConfig.codec` is
+`"raw"`.
+
+Each frame is one length-prefixed payload (section 3) starting with the
+bytes `ODRW`, which is not `{`, so it is never mistaken for control JSON.
+Little-endian after the magic:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | `ODRW` |
+| 4 | 4 | width in pixels (even) |
+| 8 | 4 | height in pixels (even) |
+| 12 | 4 | pixel format, 0 = NV12 video range, BT.709 |
+| 16 | 4 | Y plane stride in bytes |
+| 20 | 4 | CbCr plane stride in bytes |
+| 24 | 8 | capture time, ms since the Unix epoch |
+| 32 | 8 | send time, ms since the Unix epoch |
+| 40 | `ystride*height` | Y plane |
+| then | `cstride*height/2` | interleaved CbCr plane |
+
+Every frame is complete; there are no keyframes. A receiver must announce
+the video size (so its window can open) before it has anywhere to draw.
+
 ## 7. Coordinate spaces and units
 
 The most common third-party bug is a unit mismatch, so here is every space

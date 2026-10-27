@@ -197,7 +197,15 @@ final class StreamReceiver: ObservableObject {
     // Default OFF: A/B measurement showed the system video layer reaches
     // glass faster than our CAMetalLayer path (iOS gives AVSBDL a dedicated
     // compositor plane). Kept as an experimental toggle + for its metrics.
-    private var useMetalPath: Bool { UserDefaults.standard.bool(forKey: "metalRenderer") }
+    private var useMetalPath: Bool {
+        UserDefaults.standard.bool(forKey: "metalRenderer") || UserDefaults.standard.bool(forKey: "sharpUpscale")
+            || rawVideoEnabled
+    }
+
+    /// Opt-in (`defaults write <bundle id> rawVideo -bool YES`): offer the
+    /// sender uncompressed frames for a fast wired link. `rawFps` (default
+    /// 30) caps the rate so the stream fits the link.
+    private var rawVideoEnabled: Bool { UserDefaults.standard.bool(forKey: "rawVideo") }
 
     /// Called by the renderer's presented handler: maps the CACurrentMediaTime-
     /// based glass timestamp into wall-clock ms and computes true photon e2e.
@@ -634,7 +642,7 @@ final class StreamReceiver: ObservableObject {
                     // arrive before adopt(), then be indistinguishable from
                     // the old session's flow that adopt must retire.
                     self.sendHello(on: conn, includeCursorPort: false)
-                    conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 18) {
+                    conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 22) {
                         [weak self] data, _, isComplete, error in
                         guard let self else { return }
                         // Only a still-tracked candidate may adopt: adoption
@@ -856,7 +864,8 @@ final class StreamReceiver: ObservableObject {
             // H.264 remains implicit for old senders. New senders announce the
             // codec before the first binary frame.
             let codec = (obj["codec"] as? String)?.lowercased() ?? "h264"
-            guard codec == "h264" || (codec == "hevc" && hevcCapability != nil) else {
+            guard codec == "h264" || (codec == "hevc" && hevcCapability != nil)
+                || (codec == "raw" && rawVideoEnabled) else {
                 Log.info("unsupported stream codec selected: \(codec)")
                 return
             }
@@ -934,6 +943,8 @@ final class StreamReceiver: ObservableObject {
         }
         decodeWindow.removeAll(keepingCapacity: true)
         photonWindow.removeAll(keepingCapacity: true)
+        rawPool = nil
+        rawPoolSize = (0, 0)
     }
 
     // MARK: - Control messages (phone -> Mac)
@@ -969,6 +980,10 @@ final class StreamReceiver: ObservableObject {
             // The decode budget describes the device's decoder, not a codec.
             if let v = hevc.maxPixelsPerSecond ?? maxPixelsPerSecond { entry["maxPixelsPerSecond"] = v }
             videoCaps.append(entry)
+        }
+        if rawVideoEnabled {
+            let fps = UserDefaults.standard.integer(forKey: "rawFps")
+            videoCaps.append(["codec": "raw", "maxFrameRate": fps > 0 ? fps : 30])
         }
         hello["videoCaps"] = videoCaps
         // Additive capability: only offered while the UDP listener is bound,
@@ -1139,7 +1154,16 @@ final class StreamReceiver: ObservableObject {
             guard buffer.distance(from: cursor, to: buffer.endIndex) >= 4 + len else { break }
             let start = buffer.index(cursor, offsetBy: 4)
             let end = buffer.index(start, offsetBy: len)
-            handleAnnexB(Data(buffer[start..<end]))
+            if streamCodec == "raw", len >= 4,
+               buffer[start..<buffer.index(start, offsetBy: 4)].elementsEqual("ODRW".utf8) {
+                // A raw frame is ~22 MB at 5K: parse it in place, no copy.
+                let offset = buffer.distance(from: buffer.startIndex, to: start)
+                buffer.withUnsafeBytes { whole in
+                    handleRawFrame(UnsafeRawBufferPointer(rebasing: whole[offset..<offset + len]))
+                }
+            } else {
+                handleAnnexB(Data(buffer[start..<end]))
+            }
             cursor = end
         }
         buffer.removeSubrange(buffer.startIndex..<cursor)
@@ -1378,6 +1402,12 @@ final class StreamReceiver: ObservableObject {
             displayLayer.enqueue(sample)
         }
 
+        noteFrameShown(captureMs: captureMs, sendMs: sendMs)
+    }
+
+    /// Per-frame timing and the once-a-second stats window, shared by the
+    /// decoded (H.264/HEVC) and raw paths.
+    private func noteFrameShown(captureMs: Double?, sendMs: Double?) {
         // Per-frame timing for the performance overlay.
         let now = Date()
         if let last = lastFrameAt {
@@ -1424,7 +1454,7 @@ final class StreamReceiver: ObservableObject {
             stats.rttMs = lastRttMs
             stats.e2eSamples = e2eRing
             stats.transport = transport
-            stats.codec = streamCodec == "hevc" ? "HEVC" : "H.264"
+            stats.codec = streamCodec == "hevc" ? "HEVC" : streamCodec == "raw" ? "RAW" : "H.264"
             let medianInterval = percentile(frameIntervals, 0.5)
             stats.hitches = frameIntervals.filter { $0 > medianInterval * 1.5 }.count
             stats.macDrops = macDrops
@@ -1486,6 +1516,90 @@ final class StreamReceiver: ObservableObject {
                 self.perf = stats
             }
         }
+    }
+
+    // MARK: - Raw frames (PROTOCOL.md 6.8)
+
+    private var rawPool: CVPixelBufferPool?
+    private var rawPoolSize = (0, 0)
+    private var rawFrameSize = CGSize.zero
+    private var loggedBadRawFrame = false
+
+    private func rawPixelBuffer(width: Int, height: Int) -> CVPixelBuffer? {
+        if rawPool == nil || rawPoolSize != (width, height) {
+            let attrs: [CFString: Any] = [
+                kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                kCVPixelBufferWidthKey: width,
+                kCVPixelBufferHeightKey: height,
+                kCVPixelBufferMetalCompatibilityKey: true,
+                kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+            ]
+            var pool: CVPixelBufferPool?
+            CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &pool)
+            rawPool = pool
+            rawPoolSize = (width, height)
+        }
+        guard let rawPool else { return nil }
+        var buffer: CVPixelBuffer?
+        CVPixelBufferPoolCreatePixelBuffer(nil, rawPool, &buffer)
+        return buffer
+    }
+
+    /// `frame` is one length-prefixed payload that starts with the "ODRW"
+    /// header: width, height, format (0 = NV12 video range), Y stride, CbCr
+    /// stride, cap ms, snd ms (little-endian), then the two planes.
+    private func handleRawFrame(_ frame: UnsafeRawBufferPointer) {
+        guard !renderingPaused, frame.count >= 40 else { return }
+        func u32(_ offset: Int) -> Int {
+            Int(UInt32(littleEndian: frame.loadUnaligned(fromByteOffset: offset, as: UInt32.self)))
+        }
+        func i64(_ offset: Int) -> Int64 {
+            Int64(littleEndian: frame.loadUnaligned(fromByteOffset: offset, as: Int64.self))
+        }
+        let width = u32(4), height = u32(8), format = u32(12)
+        let yStride = u32(16), cStride = u32(20)
+        guard format == 0, width > 0, height > 0, width % 2 == 0, height % 2 == 0,
+              yStride >= width, cStride >= width,
+              frame.count == 40 + yStride * height + cStride * (height / 2) else {
+            if !loggedBadRawFrame {
+                loggedBadRawFrame = true
+                Log.info("raw frame rejected: \(width)x\(height) format \(format) strides \(yStride)/\(cStride) bytes \(frame.count)")
+            }
+            return
+        }
+        // The video window opens once the size is known and only then creates
+        // the picture sink, so announce the size before requiring the sink.
+        let size = CGSize(width: width, height: height)
+        if size != rawFrameSize {
+            rawFrameSize = size
+            Log.info("raw stream: \(width)x\(height)")
+            DispatchQueue.main.async { self.videoSize = size }
+            setStatus("Receiving \(width)×\(height)")
+        }
+        guard onDecodedFrame != nil else { return }
+        let t0 = nowMs
+        guard let pixelBuffer = rawPixelBuffer(width: width, height: height) else { return }
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        let planes: [(offset: Int, stride: Int, rows: Int)] = [
+            (40, yStride, height), (40 + yStride * height, cStride, height / 2)]
+        for (plane, src) in planes.enumerated() {
+            guard let dst = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, plane) else { continue }
+            let dstStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, plane)
+            let from = frame.baseAddress! + src.offset
+            if dstStride == src.stride {
+                memcpy(dst, from, src.stride * src.rows)
+            } else {
+                for row in 0..<src.rows {
+                    memcpy(dst + row * dstStride, from + row * src.stride, width)
+                }
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+        decodeWindow.append(nowMs - t0)
+
+        let captureMs = Double(i64(24)), sendMs = Double(i64(32))
+        onDecodedFrame?(pixelBuffer, captureMs)
+        noteFrameShown(captureMs: captureMs, sendMs: sendMs)
     }
 
     // MARK: - Explicit decode (Metal renderer path)
