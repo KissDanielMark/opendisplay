@@ -20,6 +20,7 @@ final class SharpUpscaleRenderer {
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private let pipeline: MTLRenderPipelineState
+    private let pipelineOneToOne: MTLRenderPipelineState
     private var textureCache: CVMetalTextureCache?
 
     private let renderQueue = DispatchQueue(label: "sharp.upscale.render", qos: .userInteractive)
@@ -45,6 +46,24 @@ final class SharpUpscaleRenderer {
         using namespace metal;
         struct U { float4 rect; float2 srcSize; float sharpen; };
         struct VOut { float4 pos [[position]]; float2 uv; };
+        // BT.709 video range to RGB; luma already clamped to the legal range.
+        float4 toRGB(float y, float2 cbcr) {
+            float yn = 1.1644 * (y - 0.0627);
+            float cb = cbcr.x - 0.5;
+            float cr = cbcr.y - 0.5;
+            return float4(yn + 1.7927 * cr,
+                          yn - 0.2133 * cb - 0.5329 * cr,
+                          yn + 2.1124 * cb,
+                          1.0);
+        }
+        // Stream and drawable have the same size: each pixel is exactly one texel.
+        fragment float4 fmain11(VOut in [[stage_in]],
+                                texture2d<float> texY [[texture(0)]],
+                                texture2d<float> texCbCr [[texture(1)]]) {
+            constexpr sampler s(filter::linear, address::clamp_to_edge);
+            float y = clamp(texY.read(uint2(in.pos.xy)).r, 0.0627, 0.9216);
+            return toRGB(y, texCbCr.sample(s, in.uv).rg);
+        }
         vertex VOut vmain(uint vid [[vertex_id]], constant U &u [[buffer(0)]]) {
             float2 c[4] = { float2(0,0), float2(1,0), float2(0,1), float2(1,1) };
             float2 q = c[vid];
@@ -89,27 +108,24 @@ final class SharpUpscaleRenderer {
                 y += u.sharpen * (y - blur);
             }
             y = clamp(y, 0.0627, 0.9216);
-            float2 cbcr = texCbCr.sample(s, in.uv).rg;
-            float yn = 1.1644 * (y - 0.0627);
-            float cb = cbcr.x - 0.5;
-            float cr = cbcr.y - 0.5;
-            return float4(yn + 1.7927 * cr,
-                          yn - 0.2133 * cb - 0.5329 * cr,
-                          yn + 2.1124 * cb,
-                          1.0);
+            return toRGB(y, texCbCr.sample(s, in.uv).rg);
         }
         """
         let lib: MTLLibrary
         do { lib = try device.makeLibrary(source: source, options: nil) }
         catch { Log.info("sharp upscale shader compile failed: \(error)"); return nil }
         guard let vfn = lib.makeFunction(name: "vmain"),
-              let ffn = lib.makeFunction(name: "fmain") else { return nil }
+              let ffn = lib.makeFunction(name: "fmain"),
+              let ffn11 = lib.makeFunction(name: "fmain11") else { return nil }
         let desc = MTLRenderPipelineDescriptor()
         desc.vertexFunction = vfn
         desc.fragmentFunction = ffn
         desc.colorAttachments[0].pixelFormat = .bgra8Unorm
-        do { pipeline = try device.makeRenderPipelineState(descriptor: desc) }
-        catch { Log.info("sharp upscale pipeline failed: \(error)"); return nil }
+        do {
+            pipeline = try device.makeRenderPipelineState(descriptor: desc)
+            desc.fragmentFunction = ffn11
+            pipelineOneToOne = try device.makeRenderPipelineState(descriptor: desc)
+        } catch { Log.info("sharp upscale pipeline failed: \(error)"); return nil }
 
         metalLayer.device = device
         metalLayer.pixelFormat = .bgra8Unorm
@@ -170,7 +186,8 @@ final class SharpUpscaleRenderer {
         pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         pass.colorAttachments[0].storeAction = .store
         guard let encoder = cmd.makeRenderCommandEncoder(descriptor: pass) else { return }
-        encoder.setRenderPipelineState(pipeline)
+        let oneToOne = Float(w) == dw && Float(h) == dh && Self.fastPathEnabled
+        encoder.setRenderPipelineState(oneToOne ? pipelineOneToOne : pipeline)
         encoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
         encoder.setFragmentBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
         encoder.setFragmentTexture(texY, index: 0)
@@ -181,9 +198,38 @@ final class SharpUpscaleRenderer {
         drawable.addPresentedHandler { [weak self] d in
             self?.onPresented?(d.presentedTime, captureMs)
         }
-        cmd.addCompletedHandler { _ in _ = cvY; _ = cvCbCr }
+        cmd.addCompletedHandler { [weak self] buffer in
+            _ = cvY; _ = cvCbCr
+            self?.noteGPUTime(buffer.gpuEndTime - buffer.gpuStartTime, oneToOne: oneToOne)
+        }
         cmd.present(drawable)
         cmd.commit()
+    }
+
+    /// `defaults write <bundle id> upscaleFastPath -bool NO` turns the 1:1 fast path off, for A/B.
+    private static var fastPathEnabled: Bool {
+        UserDefaults.standard.object(forKey: "upscaleFastPath") == nil
+            || UserDefaults.standard.bool(forKey: "upscaleFastPath")
+    }
+
+    private var gpuTimeTotal = 0.0
+    private var gpuFrames = 0
+    private var gpuWindowStart = CACurrentMediaTime()
+    private let gpuStatsLock = NSLock()
+
+    private func noteGPUTime(_ seconds: Double, oneToOne: Bool) {
+        gpuStatsLock.lock()
+        defer { gpuStatsLock.unlock() }
+        gpuTimeTotal += seconds
+        gpuFrames += 1
+        let now = CACurrentMediaTime()
+        guard now - gpuWindowStart >= 5 else { return }
+        Log.info(String(format: "upscale GPU: %.2f ms/frame over %d frames (%@)",
+                        gpuTimeTotal / Double(gpuFrames) * 1000, gpuFrames,
+                        oneToOne ? "1:1 fast path" : "resample"))
+        gpuTimeTotal = 0
+        gpuFrames = 0
+        gpuWindowStart = now
     }
 
     private static var sharpenAmount: Float {
