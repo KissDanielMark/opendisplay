@@ -129,7 +129,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // bottleneck fired. Never encode-then-discard: dropping here avoids wasting
     // VT work on frames that would only add latency.
     private var pendingSends = 0
-    private let maxPendingSends = 3
+    // Raw whole frames are 22 MB (about 19 ms on a Thunderbolt Bridge): a third
+    // queued frame is ~55 ms of pure waiting, so raw allows two. Read with
+    // `pipelineLock` held, like the counters it is compared with.
+    private var maxPendingSends: Int {
+        activeStreamConfiguration?.codec == VideoStreamConfiguration.rawCodec ? 2 : 3
+    }
     private let pipelineLock = NSLock()
     private var dropsEncThisWindow = 0
     private var dropsNetThisWindow = 0
